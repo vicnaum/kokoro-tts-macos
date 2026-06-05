@@ -198,15 +198,21 @@ oversized chunks re-split via the `tooManyTokens` catch); text normalization
 in `SSML.swift` (symbols → words, numbers, line-breaks → sentence pauses,
 verified with the `PhonemeDump` dev tool).
 
-1. Word highlighting: emit `AVSpeechSynthesisMarker`s via the AU's
-   `speechSynthesisOutputMetadataBlock` using KokoroSwift's `MToken`
-   `start_ts`/`end_ts` (generateAudio returns them; map back to char ranges).
-2. Map Spoken Content rate slider: parse `<prosody rate>` from the SSML
+**Done (v1.2.0):** word highlighting — `emitWordMarkers` builds
+`AVSpeechSynthesisMarker(.word)` from `MToken.start_ts` + a cursor-search that
+maps each token back to its range in the original SSML, handed to the AU's
+`speechSynthesisOutputMetadataBlock` (byteSampleOffset = frame × 4 for float32).
+Verified emitting correctly via `AVSpeechSynthesizer`'s `willSpeakRange` delegate
+(13/13 words, right ranges). **Caveat:** rendering is host-dependent — apps that
+implement `willSpeakRange` highlight; macOS **Spoken Content** highlighting of
+third-party voices is a longstanding, inconsistent Apple bug (not our code).
+
+1. Map Spoken Content rate slider: parse `<prosody rate>` from the SSML
    instead of stripping it (KokoroSwift `generateAudio` has a `speed:` param).
-3. More voices: add entries to `VoiceManifest.swift` (try `af_bella`,
+2. More voices: add entries to `VoiceManifest.swift` (try `af_bella`,
    `bf_emma` — British voices exercise the `.enGB` path).
-4. Longer paragraph pauses: insert silence chunks between paragraphs in the AU.
-5. Maybe: swap in a future emotive model (MisoTTS-8B is too big for an
+3. Longer paragraph pauses: insert silence chunks between paragraphs in the AU.
+4. Maybe: swap in a future emotive model (MisoTTS-8B is too big for an
    extension; Kokoro is the right size for this architecture).
 
 **Dev tool — `PhonemeDump`** (`Tools/`, `type: tool` in project.yml): runs

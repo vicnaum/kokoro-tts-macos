@@ -164,11 +164,13 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
         guard !text.isEmpty else { finishSynthesis(generation: gen); return }
 
         synthQueue.async { [weak self] in
-            self?.runStreamingSynthesis(text: text, voiceIdentifier: voiceIdentifier, generation: gen)
+            self?.runStreamingSynthesis(text: text, voiceIdentifier: voiceIdentifier,
+                                        request: speechRequest, generation: gen)
         }
     }
 
-    private func runStreamingSynthesis(text: String, voiceIdentifier: String, generation gen: Int) {
+    private func runStreamingSynthesis(text: String, voiceIdentifier: String,
+                                       request: AVSpeechSynthesisProviderRequest, generation gen: Int) {
         guard ensureEngineLoaded(), let engine else { finishSynthesis(generation: gen); return }
 
         let definition = KokoroVoiceManifest.definition(forIdentifier: voiceIdentifier)
@@ -182,31 +184,94 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
         // Kokoro naming: 'a' prefix = US English, 'b' = British English.
         let language: KokoroSwift.Language = definition.npzKey.hasPrefix("b") ? .enGB : .enUS
 
+        // Word-highlighting state (threaded locally, no shared races): a cursor
+        // into the ORIGINAL SSML — tokens are matched back to it in order — and a
+        // running frame offset into the audio we've produced so far.
+        let ssml = request.ssmlRepresentation
+        var ssmlCursor = ssml.startIndex
+        var frameOffset = 0
+
         for chunk in Self.chunks(for: text) {
             guard isCurrent(gen) else { return } // superseded or cancelled
-            synthesizeChunk(chunk, engine: engine, embedding: embedding,
-                            language: language, generation: gen, depth: 0)
+            frameOffset += synthesizeChunk(chunk, engine: engine, embedding: embedding,
+                                           language: language, request: request, ssml: ssml,
+                                           ssmlCursor: &ssmlCursor, startFrame: frameOffset,
+                                           generation: gen, depth: 0)
         }
         finishSynthesis(generation: gen)
     }
 
-    /// Synthesize one chunk; on `tooManyTokens` (the char budget under-counted
-    /// phonemes) split at the next natural boundary and retry each piece. Depth-
-    /// bounded so it always terminates (worst case: hard character cut).
+    /// Synthesize one chunk; returns the number of audio frames produced so the
+    /// caller can advance the marker frame offset. On `tooManyTokens` (the char
+    /// budget under-counted phonemes) split at the next natural boundary and
+    /// retry each piece, summing their frames. Depth-bounded so it always
+    /// terminates (worst case: hard character cut).
+    @discardableResult
     private func synthesizeChunk(_ text: String, engine: KokoroTTS, embedding: MLXArray,
-                                 language: KokoroSwift.Language, generation gen: Int, depth: Int) {
-        guard isCurrent(gen) else { return }
+                                 language: KokoroSwift.Language,
+                                 request: AVSpeechSynthesisProviderRequest, ssml: String,
+                                 ssmlCursor: inout String.Index, startFrame: Int,
+                                 generation gen: Int, depth: Int) -> Int {
+        guard isCurrent(gen) else { return 0 }
         do {
-            let (audio, _) = try engine.generateAudio(voice: embedding, language: language, text: text)
+            let (audio, tokens) = try engine.generateAudio(voice: embedding, language: language, text: text)
             enqueue(audio, generation: gen)
-        } catch KokoroTTS.KokoroTTSError.tooManyTokens where depth < 6 {
-            for piece in Self.splitTooLong(text) {
-                synthesizeChunk(piece, engine: engine, embedding: embedding,
-                                language: language, generation: gen, depth: depth + 1)
+            if let tokens {
+                emitWordMarkers(tokens, request: request, ssml: ssml,
+                                ssmlCursor: &ssmlCursor, startFrame: startFrame, generation: gen)
             }
+            return audio.count
+        } catch KokoroTTS.KokoroTTSError.tooManyTokens where depth < 6 {
+            var produced = 0
+            for piece in Self.splitTooLong(text) {
+                produced += synthesizeChunk(piece, engine: engine, embedding: embedding,
+                                            language: language, request: request, ssml: ssml,
+                                            ssmlCursor: &ssmlCursor, startFrame: startFrame + produced,
+                                            generation: gen, depth: depth + 1)
+            }
+            return produced
         } catch {
             NSLog("KokoroVoice: synthesis failed for \(text.count)-char chunk: \(error)")
+            return 0
         }
+    }
+
+    // MARK: - Word highlighting
+
+    /// Build `.word` markers from Kokoro's per-token timestamps and hand them to
+    /// the system's metadata block. Each token is matched back to the original
+    /// SSML (in order) for the highlight range; tokens rewritten by normalization
+    /// (e.g. "~" -> "approximately") simply aren't found and are skipped.
+    /// `byteSampleOffset` is the byte position in our 24 kHz float32 audio.
+    private func emitWordMarkers(_ tokens: [MToken], request: AVSpeechSynthesisProviderRequest,
+                                 ssml: String, ssmlCursor: inout String.Index,
+                                 startFrame: Int, generation gen: Int) {
+        guard let block = speechSynthesisOutputMetadataBlock, isCurrent(gen) else { return }
+        var markers: [AVSpeechSynthesisMarker] = []
+        for token in tokens {
+            guard let startTs = token.start_ts,
+                  let range = Self.advanceSSMLRange(for: token.text, in: ssml, cursor: &ssmlCursor)
+            else { continue }
+            let frame = startFrame + Int(startTs * Self.sampleRate)
+            let byteOffset = frame * MemoryLayout<Float>.size   // float32: 4 bytes/frame
+            markers.append(AVSpeechSynthesisMarker(markerType: .word,
+                                                   forTextRange: range,
+                                                   atByteSampleOffset: byteOffset))
+        }
+        if !markers.isEmpty { block(markers, request) }
+    }
+
+    /// Find `tokenText` in `ssml` from `cursor` (case-insensitive), advancing the
+    /// cursor past the match. Returns the NSRange, or nil if not present verbatim.
+    private static func advanceSSMLRange(for tokenText: String, in ssml: String,
+                                         cursor: inout String.Index) -> NSRange? {
+        let needle = tokenText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty, cursor < ssml.endIndex,
+              let found = ssml.range(of: needle, options: [.caseInsensitive],
+                                     range: cursor..<ssml.endIndex)
+        else { return nil }
+        cursor = found.upperBound
+        return NSRange(found, in: ssml)
     }
 
     public override func cancelSpeechRequest() {
