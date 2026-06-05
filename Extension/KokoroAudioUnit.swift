@@ -148,6 +148,7 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
 
     public override func synthesizeSpeechRequest(_ speechRequest: AVSpeechSynthesisProviderRequest) {
         let text = SSML.plainText(from: speechRequest.ssmlRepresentation)
+        let speed = SSML.speedMultiplier(from: speechRequest.ssmlRepresentation)
         let voiceIdentifier = speechRequest.voice.identifier
 
         // Reset streaming state and claim a new generation atomically.
@@ -165,11 +166,11 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
 
         synthQueue.async { [weak self] in
             self?.runStreamingSynthesis(text: text, voiceIdentifier: voiceIdentifier,
-                                        request: speechRequest, generation: gen)
+                                        speed: speed, request: speechRequest, generation: gen)
         }
     }
 
-    private func runStreamingSynthesis(text: String, voiceIdentifier: String,
+    private func runStreamingSynthesis(text: String, voiceIdentifier: String, speed: Float,
                                        request: AVSpeechSynthesisProviderRequest, generation gen: Int) {
         guard ensureEngineLoaded(), let engine else { finishSynthesis(generation: gen); return }
 
@@ -194,7 +195,7 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
         for chunk in Self.chunks(for: text) {
             guard isCurrent(gen) else { return } // superseded or cancelled
             frameOffset += synthesizeChunk(chunk, engine: engine, embedding: embedding,
-                                           language: language, request: request, ssml: ssml,
+                                           language: language, speed: speed, request: request, ssml: ssml,
                                            ssmlCursor: &ssmlCursor, startFrame: frameOffset,
                                            generation: gen, depth: 0)
         }
@@ -208,13 +209,14 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
     /// terminates (worst case: hard character cut).
     @discardableResult
     private func synthesizeChunk(_ text: String, engine: KokoroTTS, embedding: MLXArray,
-                                 language: KokoroSwift.Language,
+                                 language: KokoroSwift.Language, speed: Float,
                                  request: AVSpeechSynthesisProviderRequest, ssml: String,
                                  ssmlCursor: inout String.Index, startFrame: Int,
                                  generation gen: Int, depth: Int) -> Int {
         guard isCurrent(gen) else { return 0 }
         do {
-            let (audio, tokens) = try engine.generateAudio(voice: embedding, language: language, text: text)
+            let (audio, tokens) = try engine.generateAudio(voice: embedding, language: language,
+                                                           text: text, speed: speed)
             enqueue(audio, generation: gen)
             if let tokens {
                 emitWordMarkers(tokens, request: request, ssml: ssml,
@@ -225,7 +227,7 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
             var produced = 0
             for piece in Self.splitTooLong(text) {
                 produced += synthesizeChunk(piece, engine: engine, embedding: embedding,
-                                            language: language, request: request, ssml: ssml,
+                                            language: language, speed: speed, request: request, ssml: ssml,
                                             ssmlCursor: &ssmlCursor, startFrame: startFrame + produced,
                                             generation: gen, depth: depth + 1)
             }

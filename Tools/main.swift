@@ -24,6 +24,7 @@ if args.isEmpty {
     raw = args.joined(separator: " ")
 }
 
+print("=== SPEED (from rate) = \(SSML.speedMultiplier(from: raw)) ===\n")
 let normalized = skipNormalization ? raw : SSML.plainText(from: raw)
 let g2p = EnglishG2P(british: false)
 let (phonemes, tokens) = g2p.phonemize(text: normalized)

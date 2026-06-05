@@ -47,6 +47,27 @@ enum SSML {
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    // MARK: - Rate
+
+    /// Spoken Content encodes its speed slider as `<prosody rate="PERCENT">`,
+    /// where 100 = normal speed (the attribute is omitted at the default). Map it
+    /// to KokoroSwift's `speed` multiplier (1.0 = normal). Clamped so the slider
+    /// extremes (12.5%–400%) don't drive Kokoro into degenerate territory.
+    static func speedMultiplier(from ssml: String) -> Float {
+        // Scan the opening <prosody …> tag for rate="P".
+        guard let prosody = ssml.range(of: "<prosody"),
+              let tagEnd = ssml[prosody.upperBound...].firstIndex(of: ">") else { return 1.0 }
+        let tag = ssml[prosody.upperBound..<tagEnd]
+        guard let rate = tag.range(of: "rate=\""),
+              let valueEnd = tag[rate.upperBound...].firstIndex(of: "\"") else { return 1.0 }
+        // Keep only digits + the decimal point: the host injects a stray
+        // (invisible) character into the rate value, which otherwise makes
+        // Float("12.5") return nil.
+        let value = tag[rate.upperBound..<valueEnd].filter { $0.isNumber || $0 == "." }
+        guard let percent = Float(value) else { return 1.0 }
+        return min(max(percent / 100.0, 0.5), 2.0)
+    }
+
     // MARK: - Symbol normalization
 
     /// Replace symbols that the G2P drops or sends to its neural guesser with
