@@ -23,6 +23,11 @@ packages:
   mlx-swift:
     url: https://github.com/ml-explore/mlx-swift
     exactVersion: "0.29.1"
+  # Misaki is the G2P (already transitive via KokoroSwift); declared directly so
+  # the PhonemeDump dev tool can call it. Pinned to the resolved version.
+  MisakiSwift:
+    url: https://github.com/mlalma/MisakiSwift
+    exactVersion: "1.0.5"
 
 settings:
   base:
@@ -112,3 +117,18 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.vicnaum.kokorovoice.extension
         ENABLE_HARDENED_RUNTIME: true
+
+  # Dev-only CLI: dumps Misaki's phoneme output so we can verify text
+  # normalization (numbers/symbols/newlines) without having to listen.
+  PhonemeDump:
+    type: tool
+    platform: macOS
+    sources:
+      - Tools
+      - path: Extension/SSML.swift
+    dependencies:
+      - package: MisakiSwift
+    settings:
+      base:
+        SWIFT_ENABLE_EXPLICIT_MODULES: "NO"
+        PRODUCT_BUNDLE_IDENTIFIER: com.vicnaum.kokorovoice.phonemedump
