@@ -72,6 +72,8 @@ targets:
       path: App/Info.plist
       properties:
         CFBundleDisplayName: Kokoro Voice
+        CFBundleShortVersionString: "1.1.0"
+        CFBundleVersion: "2"
         LSApplicationCategoryType: public.app-category.utilities
         NSHumanReadableCopyright: ""
     settings:

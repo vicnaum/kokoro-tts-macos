@@ -189,16 +189,32 @@ spctl -a -vvv -t exec <Release>/KokoroVoice.app          # -> accepted / Notariz
 
 Target Mac requirement: **Apple Silicon, macOS 15+** (Kokoro/MLX).
 
-## Roadmap (after it builds)
+## Roadmap
 
-1. Word highlighting: emit marker events using KokoroSwift token timestamps.
+**Done (v1.1.0):** streaming / sentence-chunked synthesis (Kokoro is non-
+autoregressive with a hard 510-token limit, so whole-text synthesis threw
+`tooManyTokens` on long selections — now chunked, hybrid first-sentence start,
+oversized chunks re-split via the `tooManyTokens` catch); text normalization
+in `SSML.swift` (symbols → words, numbers, line-breaks → sentence pauses,
+verified with the `PhonemeDump` dev tool).
+
+1. Word highlighting: emit `AVSpeechSynthesisMarker`s via the AU's
+   `speechSynthesisOutputMetadataBlock` using KokoroSwift's `MToken`
+   `start_ts`/`end_ts` (generateAudio returns them; map back to char ranges).
 2. Map Spoken Content rate slider: parse `<prosody rate>` from the SSML
-   instead of stripping it (KokoroSwift has a speed parameter).
-3. Streaming: synthesize sentence-by-sentence so long selections start faster.
-4. More voices: add entries to `VoiceManifest.swift` (try `af_bella`,
+   instead of stripping it (KokoroSwift `generateAudio` has a `speed:` param).
+3. More voices: add entries to `VoiceManifest.swift` (try `af_bella`,
    `bf_emma` — British voices exercise the `.enGB` path).
+4. Longer paragraph pauses: insert silence chunks between paragraphs in the AU.
 5. Maybe: swap in a future emotive model (MisoTTS-8B is too big for an
    extension; Kokoro is the right size for this architecture).
+
+**Dev tool — `PhonemeDump`** (`Tools/`, `type: tool` in project.yml): runs
+`SSML.swift` + Misaki's real G2P and prints raw → normalized → phonemes, so you
+can debug pronunciation and add normalization rules without listening. Build the
+`PhonemeDump` scheme, then run it from the build products dir with
+`DYLD_FRAMEWORK_PATH=<Build/Products/Debug>:<…/PackageFrameworks>` (it links the
+dynamic MLX/Misaki frameworks). `--raw` skips normalization.
 
 ## Conventions
 
