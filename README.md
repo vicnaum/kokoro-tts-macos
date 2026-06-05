@@ -10,6 +10,16 @@ as real system voices via an Audio Unit speech synthesis extension
 Kokoro Michael (`am_michael`, US male). Add more in
 `Extension/VoiceManifest.swift` — one entry per voice, the model is shared.
 
+## Download (no build required)
+
+Grab the notarized installer from
+**[Releases](../../releases/latest)** → open `KokoroVoice.dmg` → drag
+**KokoroVoice** into Applications → launch it once → then
+System Settings → Accessibility → Spoken Content → System voice →
+**Kokoro Heart** / **Kokoro Michael**. Requires Apple Silicon + macOS 15+.
+
+The rest of this README is for building from source.
+
 ## Requirements
 
 - Apple Silicon Mac, macOS 15.0+
@@ -97,3 +107,15 @@ Dependencies (SPM, resolved automatically): [KokoroSwift](https://github.com/mla
   step.
 - The whole utterance is synthesized before playback starts (no streaming),
   so very long selections have a noticeable lead-in.
+
+## License & credits
+
+MIT — see [LICENSE](LICENSE). Built on:
+
+- [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) — the neural TTS model (Apache-2.0)
+- [KokoroSwift](https://github.com/mlalma/kokoro-ios) — MLX Swift port of Kokoro (MIT).
+  This project pins a [one-line fork](https://github.com/vicnaum/kokoro-ios/tree/mlxfast-fix)
+  that adds the missing `MLXFast` package dependency.
+- [MLX Swift](https://github.com/ml-explore/mlx-swift) and
+  [MLXUtilsLibrary](https://github.com/mlalma/MLXUtilsLibrary) (MIT)
+- Render pattern from [bocoup/apple-custom-speech-synthesizer](https://github.com/bocoup/apple-custom-speech-synthesizer)

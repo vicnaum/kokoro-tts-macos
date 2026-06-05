@@ -131,7 +131,7 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
         }
 
         // Kokoro naming: 'a' prefix = US English, 'b' = British English.
-        let language: KokoroTTS.Language = definition.npzKey.hasPrefix("b") ? .enGB : .enUS
+        let language: KokoroSwift.Language = definition.npzKey.hasPrefix("b") ? .enGB : .enUS
 
         do {
             let (audio, _) = try engine.generateAudio(

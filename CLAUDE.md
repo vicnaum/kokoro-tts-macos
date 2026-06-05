@@ -11,8 +11,13 @@ top-rated) and `am_michael` ("Kokoro Michael", US male).
 
 ## Current state (June 2026)
 
-Scaffold written by Claude in Cowork mode from API research, **never compiled**
-— expect minor build fixes, that's the immediate job. One git commit exists.
+**Builds, signs (ad-hoc), registers, and synthesizes — verified working on
+Xcode 26.3 / macOS 26 / Apple Silicon.** Both voices produce correct 24 kHz
+neural audio through the real system speech path (`AVSpeechSynthesizer` →
+extension → KokoroSwift/MLX), confirmed by capturing the PCM via
+`AVSpeechSynthesizer.write` (24000 Hz, non-silent). Getting from the original
+scaffold to a green build took one code fix, a dependency-graph re-pin, and a
+one-line fork of KokoroSwift — see **Resolved build issues** below.
 
 - `project.yml` — XcodeGen manifest, two targets: `KokoroVoice` (SwiftUI host
   app) and `KokoroVoiceExtension` (app extension, embedded). The `.xcodeproj`
@@ -73,22 +78,116 @@ From [bocoup/apple-custom-speech-synthesizer](https://github.com/bocoup/apple-cu
 - Render pattern: fill output from a pre-synthesized `AVAudioPCMBuffer`, set
   `actionFlags = .offlineUnitRenderAction_Complete` when exhausted
 
-## Known weak spots (most likely build failures)
+## Resolved build issues (June 2026)
 
-1. **MLXUtilsLibrary pinned to `branch: main`** in project.yml — if SPM
-   resolution conflicts with kokoro-ios's pin, use the exact revision from
-   kokoro-ios `Package.resolved`.
-2. Exact spelling of `KokoroTTS.Language` cases and the tuple shape of
-   `generateAudio` — confirmed from the test app, but the library moves fast;
-   check against the pinned version's source in
-   `~/Library/Developer/Xcode/DerivedData/.../SourcePackages/checkouts/kokoro-ios`.
-3. `AVSpeechSynthesisProviderVoice` init signature in `VoiceManifest.swift`
-   (taken from bocoup sample, older SDK — verify against current SDK).
-4. xcodegen rendering of the nested `NSExtension` dict in project.yml —
-   inspect the generated `Extension/Info.plist` after first `xcodegen` run.
-5. MLX inside a sandboxed extension (Metal shader compilation) — believed
-   fine; if synthesis dies silently, test the same code path inside the host
-   app first to isolate.
+What actually broke on Xcode 26.3 and how it's fixed. All fixes are persistent
+(in `project.yml`, `Extension/`, or the KokoroSwift fork) — nothing lives only in
+DerivedData.
+
+1. **`KokoroTTS.Language` doesn't exist** — the enum is top-level in the module,
+   so it's `KokoroSwift.Language`, not nested. Fixed in `KokoroAudioUnit.swift`.
+2. **KokoroSwift's manifest under-declares `MLXFast`** — its sources
+   `import MLXFast` but the target only depended on MLX/MLXNN/MLXRandom/MLXFFT.
+   Implicit-module builds tolerate the transitive import via MLXNN; Xcode 16+/26
+   **explicit-module** builds fail with `no such module 'MLXFast'`. Fixed via a
+   one-line fork — `vicnaum/kokoro-ios @ mlxfast-fix` (commit pinned by `revision`
+   in project.yml). `SWIFT_ENABLE_EXPLICIT_MODULES: NO` is also set as a belt-and-
+   suspenders against other under-declared transitive imports.
+3. **Dependency graph re-pinned to KokoroSwift's tested `Package.resolved`** — the
+   old `MLXUtilsLibrary: branch: main` resolved to commit `66f7cd5` ("removed
+   BenchmarkTimer"), which KokoroSwift still calls → `cannot find 'BenchmarkTimer'`.
+   project.yml now pins MLXUtilsLibrary `0.0.6` and mlx-swift `0.29.1` (exact),
+   the combination KokoroSwift 1.0.10 was built against. Do **not** float these.
+4. **Metal Toolchain is a separate download in Xcode 26** — MLX compiles `.metal`
+   shaders; first build fails with `cannot execute tool 'metal'`. One-time fix:
+   `xcodebuild -downloadComponent MetalToolchain` (~700 MB).
+5. **CLI signing** — automatic signing needs an Apple account `xcodebuild` can
+   reach, and it can't ("No Account for Team"). For local runs, build ad-hoc (see
+   recipe). For a distributable signed build, set your Team in Xcode and build there.
+   The `NSExtension`/`ausp` AudioComponent dict (weak-spot we worried about) renders
+   correctly from project.yml — no change needed.
+
+Non-obvious runtime fact: the system **prepends the extension bundle id** to each
+voice identifier, so the registered id is
+`com.vicnaum.kokorovoice.extension.com.vicnaum.kokorovoice.af_heart`, not the bare
+`com.vicnaum.kokorovoice.af_heart`. The host app's `hasPrefix` filter still matches
+(the prefix is contained), but `AVSpeechSynthesisVoice(identifier:)` on the **bare**
+id silently falls back to the default system voice — pick the voice object out of
+`speechVoices()` instead of constructing it from the short id.
+
+Non-obvious runtime fact #2 — **Spoken Content needs the app in `/Applications`**:
+AVSpeechSynthesizer (apps, incl. our host app's Speak button) loads the extension
+from anywhere, but the sandboxed Spoken Content daemons (`AXVisualSupportAgent` →
+`MauiAUSP`) cannot load our `ausp/kkro/Vicn` audio unit out of
+`~/Library/Developer/Xcode/DerivedData`. The tell (unified log): `findNext
+ausp/kkro/Vicn -> ausp/kona/appl` then `CoreSynthesizer … retryFallbackVoice` →
+you hear a robotic Apple voice. Fix: copy the built `.app` to `/Applications`,
+`lsregister -f` it, and `killall AXVisualSupportAgent MauiAUSP` (or log out/in).
+
+### Headless build + verify recipe (no Xcode GUI)
+
+```bash
+brew install xcodegen
+xcodebuild -downloadComponent MetalToolchain      # once, Xcode 26+
+./download_models.sh                              # once
+xcodegen
+xcodebuild -project KokoroVoice.xcodeproj -scheme KokoroVoice -configuration Debug \
+  -destination 'platform=macOS' \
+  CODE_SIGN_IDENTITY="-" CODE_SIGN_STYLE=Manual CODE_SIGNING_REQUIRED=YES \
+  CODE_SIGNING_ALLOWED=YES DEVELOPMENT_TEAM="" PROVISIONING_PROFILE_SPECIFIER="" \
+  SWIFT_ENABLE_EXPLICIT_MODULES=NO build
+open <DerivedData>/.../Build/Products/Debug/KokoroVoice.app   # registers extension
+pluginkit -m | grep -i kokoro                                 # confirm registration
+```
+
+First build compiles all of MLX from source (~10 min); later builds are fast.
+First synthesis loads the 312 MB model in the extension (a few seconds).
+
+## Distribution (Developer ID + notarization) — verified working
+
+Shipping to another Mac needs a **paid Apple Developer Program** account (team
+`HAVQAJTX35`; the `JP93BJRSQ8` cert is the free Personal Team and can't notarize).
+Four non-obvious things, all now baked into `project.yml`:
+
+1. **Embed the dynamic frameworks.** `KokoroSwift` (and `MLXUtilsLibrary`) are
+   `type: .dynamic`; MLX/Cmlx/Numerics build dynamic alongside them. App
+   extensions can't carry frameworks, so the **host app** embeds them
+   (`KokoroVoice` target depends on `package: KokoroSwift` with `embed: true` —
+   its closure pulls the other four; listing them too → "duplicate tasks"). The
+   extension finds them via its `@executable_path/../../../../Frameworks` rpath.
+   Without this the extension crashes at launch (`dyld: Library not loaded:
+   @rpath/KokoroSwift.framework`). Debug builds *masked* this by loading the
+   framework from DerivedData — it would never have run on another Mac.
+2. **Release strips `get-task-allow`.** `configs.Release` sets
+   `CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO`; otherwise the notary rejects the
+   build ("The executable requests the com.apple.security.get-task-allow
+   entitlement"). Debug keeps it (debuggable).
+3. **Hardened runtime is fine for MLX** — no JIT entitlement needed; Metal
+   compiles shaders out-of-process. (`voices.npz` triggers a benign notary
+   *warning* — it's a zip of npy arrays, no executables.)
+4. After swapping the `.app` in `/Applications` several times, `speechVoices()`
+   can return 0 (stale AudioComponent cache) — `killall coreaudiod` refreshes it.
+
+Recipe (one-time: create a "Developer ID Application" cert + a notary keychain
+profile: `xcrun notarytool store-credentials KokoroNotary --apple-id <id>
+--team-id HAVQAJTX35`):
+
+```bash
+xcodebuild -project KokoroVoice.xcodeproj -scheme KokoroVoice -configuration Release \
+  -destination 'platform=macOS' \
+  CODE_SIGN_IDENTITY="Developer ID Application: VIKTAR NAUMIK (HAVQAJTX35)" \
+  CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=HAVQAJTX35 PROVISIONING_PROFILE_SPECIFIER="" \
+  ENABLE_HARDENED_RUNTIME=YES OTHER_CODE_SIGN_FLAGS="--timestamp" \
+  SWIFT_ENABLE_EXPLICIT_MODULES=NO build
+ditto -c -k --keepParent <Release>/KokoroVoice.app /tmp/k.zip
+xcrun notarytool submit /tmp/k.zip --keychain-profile KokoroNotary --wait   # -> Accepted
+xcrun stapler staple <Release>/KokoroVoice.app
+spctl -a -vvv -t exec <Release>/KokoroVoice.app          # -> accepted / Notarized Developer ID
+# package: stapled app + /Applications symlink into a UDZO dmg, then
+# codesign --timestamp the dmg, notarytool submit it, stapler staple it.
+```
+
+Target Mac requirement: **Apple Silicon, macOS 15+** (Kokoro/MLX).
 
 ## Roadmap (after it builds)
 

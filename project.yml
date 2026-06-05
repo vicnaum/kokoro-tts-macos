@@ -5,20 +5,41 @@ options:
     macOS: "15.0"
   createIntermediateGroups: true
 
+# Versions pinned to KokoroSwift 1.0.10's own Package.resolved — the exact,
+# mutually-tested combination. Do NOT float these: MLXUtilsLibrary main/0.0.7
+# removed `BenchmarkTimer` (which KokoroSwift still calls), and mlx-swift >0.29.x
+# drifts from the API KokoroSwift was built against.
 packages:
   KokoroSwift:
-    url: https://github.com/mlalma/kokoro-ios.git
-    from: "1.0.8"
+    # Fork of mlalma/kokoro-ios @ 1.0.10 with a single fix: upstream's manifest
+    # imports MLXFast without declaring it as a target dependency, which breaks
+    # Xcode 16+/26 explicit-module builds ("no such module 'MLXFast'"). Pinned to
+    # the exact commit. Branch: vicnaum/kokoro-ios @ mlxfast-fix.
+    url: https://github.com/vicnaum/kokoro-ios.git
+    revision: bb6cefb67bc4bb0dd6bb4da38ce835dace4b1dab
   MLXUtilsLibrary:
     url: https://github.com/mlalma/MLXUtilsLibrary.git
-    branch: main
+    exactVersion: "0.0.6"
+  mlx-swift:
+    url: https://github.com/ml-explore/mlx-swift
+    exactVersion: "0.29.1"
 
 settings:
   base:
     SWIFT_VERSION: "5.10"
     CODE_SIGN_STYLE: Automatic
+    # KokoroSwift's manifest under-declares its module deps (imports MLXFast
+    # without depending on it). Xcode 16+/26 explicit modules reject that;
+    # implicit modules tolerate the transitive import.
+    SWIFT_ENABLE_EXPLICIT_MODULES: "NO"
     # Set your Apple Development team in Xcode (Signing & Capabilities) or here:
     # DEVELOPMENT_TEAM: XXXXXXXXXX
+  configs:
+    Release:
+      # Don't inject com.apple.security.get-task-allow into Release builds —
+      # it's the "debuggable" entitlement and Apple's notary service rejects it.
+      # (Debug keeps it so the app stays debuggable.)
+      CODE_SIGN_INJECT_BASE_ENTITLEMENTS: "NO"
 
 targets:
   KokoroVoice:
@@ -28,6 +49,15 @@ targets:
       - App
     dependencies:
       - target: KokoroVoiceExtension
+        embed: true
+      # The extension links dynamic frameworks (KokoroSwift, MLXUtilsLibrary,
+      # MLX, Cmlx, Numerics) but app extensions can't carry frameworks — the
+      # host app must embed them in Contents/Frameworks, where the extension
+      # finds them via its @executable_path/../../../../Frameworks rpath.
+      # Embedding KokoroSwift alone pulls its whole transitive closure (the
+      # other four); listing them explicitly would double-embed and fail with
+      # "Unexpected duplicate tasks".
+      - package: KokoroSwift
         embed: true
     entitlements:
       path: App/KokoroVoice.entitlements
@@ -54,6 +84,8 @@ targets:
     dependencies:
       - package: KokoroSwift
       - package: MLXUtilsLibrary
+      - package: mlx-swift
+        product: MLX
     entitlements:
       path: Extension/KokoroVoiceExtension.entitlements
       properties:
