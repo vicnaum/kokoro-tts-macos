@@ -1,0 +1,82 @@
+name: KokoroVoice
+options:
+  bundleIdPrefix: com.vicnaum
+  deploymentTarget:
+    macOS: "15.0"
+  createIntermediateGroups: true
+
+packages:
+  KokoroSwift:
+    url: https://github.com/mlalma/kokoro-ios.git
+    from: "1.0.8"
+  MLXUtilsLibrary:
+    url: https://github.com/mlalma/MLXUtilsLibrary.git
+    branch: main
+
+settings:
+  base:
+    SWIFT_VERSION: "5.10"
+    CODE_SIGN_STYLE: Automatic
+    # Set your Apple Development team in Xcode (Signing & Capabilities) or here:
+    # DEVELOPMENT_TEAM: XXXXXXXXXX
+
+targets:
+  KokoroVoice:
+    type: application
+    platform: macOS
+    sources:
+      - App
+    dependencies:
+      - target: KokoroVoiceExtension
+        embed: true
+    entitlements:
+      path: App/KokoroVoice.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: Kokoro Voice
+        LSApplicationCategoryType: public.app-category.utilities
+        NSHumanReadableCopyright: ""
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.vicnaum.kokorovoice
+        ENABLE_HARDENED_RUNTIME: true
+
+  KokoroVoiceExtension:
+    type: app-extension
+    platform: macOS
+    sources:
+      - Extension
+      - path: Resources
+        buildPhase: resources
+    dependencies:
+      - package: KokoroSwift
+      - package: MLXUtilsLibrary
+    entitlements:
+      path: Extension/KokoroVoiceExtension.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+    info:
+      path: Extension/Info.plist
+      properties:
+        CFBundleDisplayName: Kokoro Voice Extension
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.AudioUnit
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).AudioUnitFactory
+          NSExtensionAttributes:
+            AudioComponents:
+              - description: Kokoro neural TTS voices
+                manufacturer: Vicn
+                name: "Vicnaum: KokoroVoiceExtension"
+                sandboxSafe: true
+                subtype: kkro
+                tags:
+                  - Speech Synthesizer
+                type: ausp
+                version: 65536
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.vicnaum.kokorovoice.extension
+        ENABLE_HARDENED_RUNTIME: true
