@@ -56,6 +56,13 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
     /// guard for pathological inputs.
     private static let maxCharBudget = 160
 
+    /// Kokoro pads every synthesized chunk with silence (~0.3s leading, ~0.75s
+    /// trailing). Fine for a whole utterance, but when we chunk, each seam becomes
+    /// a ~1s dead-air gap that sounds like a stutter/dropout. We cap each chunk's
+    /// edge silence to these amounts so seams become a normal sentence pause.
+    private static let leadingSilenceCap = Int(0.06 * sampleRate)   // 60 ms
+    private static let trailingSilenceCap = Int(0.34 * sampleRate)  // 340 ms
+
     // MARK: - Streaming state
     //
     // Producer: `synthQueue` (background). Consumer: the render block. All of it
@@ -257,15 +264,20 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
         guard isCurrent(gen) else { return 0 }
         do {
             let synthT0 = CFAbsoluteTimeGetCurrent()
-            let (audio, tokens) = try engine.generateAudio(voice: embedding, language: language,
-                                                           text: text, speed: speed)
+            let (rawAudio, tokens) = try engine.generateAudio(voice: embedding, language: language,
+                                                              text: text, speed: speed)
             let synthSec = CFAbsoluteTimeGetCurrent() - synthT0
+            // Trim Kokoro's per-chunk silence padding so concatenated chunks don't
+            // get ~1s gaps at the seams.
+            let (audio, leadingRemoved) = Self.capEdgeSilence(rawAudio,
+                leadingCap: Self.leadingSilenceCap, trailingCap: Self.trailingSilenceCap)
+            let rawSec = Double(rawAudio.count) / Self.sampleRate
             let chunkAudioSec = Double(audio.count) / Self.sampleRate
-            NSLog("KokoroVoice: [diag] synth chunk chars=\(text.count) depth=\(depth) audio=\(String(format: "%.2f", chunkAudioSec))s synth=\(String(format: "%.2f", synthSec))s RTF=\(String(format: "%.2f", synthSec / max(chunkAudioSec, 0.001))) (RTF<1.0 = faster than real-time)")
+            NSLog("KokoroVoice: [diag] synth chunk chars=\(text.count) depth=\(depth) audio=\(String(format: "%.2f", chunkAudioSec))s (raw \(String(format: "%.2f", rawSec))s) synth=\(String(format: "%.2f", synthSec))s RTF=\(String(format: "%.2f", synthSec / max(rawSec, 0.001))) (RTF<1.0 = faster than real-time)")
             enqueue(audio, generation: gen)
             if let tokens {
                 emitWordMarkers(tokens, request: request, ssml: ssml,
-                                ssmlCursor: &ssmlCursor, startFrame: startFrame, generation: gen)
+                                ssmlCursor: &ssmlCursor, startFrame: startFrame - leadingRemoved, generation: gen)
             }
             return audio.count
         } catch KokoroTTS.KokoroTTSError.tooManyTokens where depth < 6 {
@@ -299,7 +311,7 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
             guard let startTs = token.start_ts,
                   let range = Self.advanceSSMLRange(for: token.text, in: ssml, cursor: &ssmlCursor)
             else { continue }
-            let frame = startFrame + Int(startTs * Self.sampleRate)
+            let frame = max(0, startFrame + Int(startTs * Self.sampleRate))
             let byteOffset = frame * MemoryLayout<Float>.size   // float32: 4 bytes/frame
             markers.append(AVSpeechSynthesisMarker(markerType: .word,
                                                    forTextRange: range,
@@ -425,6 +437,26 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
         let first = String(chars[0..<cut]).trimmingCharacters(in: .whitespacesAndNewlines)
         let second = String(chars[cut...]).trimmingCharacters(in: .whitespacesAndNewlines)
         return [first, second].filter { !$0.isEmpty }
+    }
+
+    /// Trim Kokoro's silence padding from a chunk's edges, keeping at most
+    /// `leadingCap`/`trailingCap` samples. Returns the trimmed audio and how many
+    /// leading samples were removed (so word-marker offsets stay aligned). Only the
+    /// contiguous run from each edge is touched — internal pauses are preserved.
+    private static func capEdgeSilence(_ audio: [Float], leadingCap: Int, trailingCap: Int)
+        -> (audio: [Float], leadingRemoved: Int) {
+        let threshold: Float = 0.01
+        let n = audio.count
+        guard n > 0 else { return (audio, 0) }
+        var firstVoice = 0
+        while firstVoice < n, abs(audio[firstVoice]) < threshold { firstVoice += 1 }
+        guard firstVoice < n else { return (audio, 0) }   // all silence: leave untouched
+        var lastVoice = n - 1
+        while lastVoice > firstVoice, abs(audio[lastVoice]) < threshold { lastVoice -= 1 }
+        let start = max(0, firstVoice - leadingCap)
+        let end = min(n - 1, lastVoice + trailingCap)
+        if start == 0, end == n - 1 { return (audio, 0) }
+        return (Array(audio[start...end]), start)
     }
 
     // MARK: - Rendering (consumer side)
