@@ -82,6 +82,10 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
     private var dbgUnderruns = 0
     private var dbgSlowCallbacks = 0
     private var dbgLastCbEnd: Double = 0
+    private var dbgFirstCbTime: Double = 0      // wall time of first render callback
+    private var dbgOfflineWaitCount = 0         // times the offline render blocked for a chunk
+    private var dbgOfflineWaitTotal: Double = 0 // total seconds blocked
+    private var dbgOfflineWaitMax: Double = 0   // longest single block (the glitch signature)
 
     private let synthQueue = DispatchQueue(
         label: "com.vicnaum.kokorovoice.synth", qos: .userInitiated
@@ -185,6 +189,10 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
         dbgUnderruns = 0
         dbgSlowCallbacks = 0
         dbgLastCbEnd = 0
+        dbgFirstCbTime = 0
+        dbgOfflineWaitCount = 0
+        dbgOfflineWaitTotal = 0
+        dbgOfflineWaitMax = 0
         cond.signal()
         cond.unlock()
 
@@ -457,7 +465,10 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
                     NSLog("KokoroVoice: [diag] LIVE UNDERRUN #\(self.dbgUnderruns) at \(String(format: "%.2f", Double(logUnderrunAtFrame) / Self.sampleRate))s — re-priming")
                 }
                 if logCompleteAtFrame >= 0 {
-                    NSLog("KokoroVoice: [diag] render complete total=\(String(format: "%.2f", Double(logCompleteAtFrame) / Self.sampleRate))s underruns=\(self.dbgUnderruns) anomalies=\(self.dbgSlowCallbacks)")
+                    let audioSec = Double(logCompleteAtFrame) / Self.sampleRate
+                    let pullWall = self.dbgFirstCbTime > 0 ? now - self.dbgFirstCbTime : 0
+                    let pullRate = pullWall > 0 ? audioSec / pullWall : 0
+                    NSLog("KokoroVoice: [diag] render complete audio=\(String(format: "%.2f", audioSec))s pullWall=\(String(format: "%.2f", pullWall))s pullRate=\(String(format: "%.2f", pullRate))x | offlineBlocks=\(self.dbgOfflineWaitCount) total=\(String(format: "%.2f", self.dbgOfflineWaitTotal))s max=\(String(format: "%.2f", self.dbgOfflineWaitMax))s | underruns=\(self.dbgUnderruns) anomalies=\(self.dbgSlowCallbacks)")
                 }
                 // Real-time anomalies (live only): a callback that runs longer than
                 // its audio budget, waits a long time for the lock (contention with
@@ -479,7 +490,7 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
             self.cond.lock()
             lockWait = CFAbsoluteTimeGetCurrent() - lockT0
 
-            if !self.dbgRenderLogged { self.dbgRenderLogged = true; logFirst = true }
+            if !self.dbgRenderLogged { self.dbgRenderLogged = true; logFirst = true; self.dbgFirstCbTime = cbStart }
 
             // Live priming: don't begin (or resume after an underrun) until a few
             // chunks are buffered, so a slower Mac plays gap-free instead of
@@ -511,7 +522,16 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
                         // render thread isn't real-time). Live: emit silence and
                         // pick up the audio on the next render callback.
                         if self.isRenderingOffline {
+                            // Offline (the path AVSpeechSynthesizer / Spoken Content
+                            // actually use): block until the next chunk exists. The
+                            // host pulls this paced ~real-time, so a long block here
+                            // on a slow Mac starves playback → the glitch. Measure it.
+                            let waitStart = CFAbsoluteTimeGetCurrent()
                             self.cond.wait()   // releases the lock until signaled
+                            let waited = CFAbsoluteTimeGetCurrent() - waitStart
+                            self.dbgOfflineWaitCount += 1
+                            self.dbgOfflineWaitTotal += waited
+                            if waited > self.dbgOfflineWaitMax { self.dbgOfflineWaitMax = waited }
                             continue
                         }
                         // Live underrun: re-prime so we resume only once enough is

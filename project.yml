@@ -73,7 +73,7 @@ targets:
       properties:
         CFBundleDisplayName: Kokoro Voice
         CFBundleShortVersionString: "1.3.1"
-        CFBundleVersion: "6"
+        CFBundleVersion: "7"
         LSApplicationCategoryType: public.app-category.utilities
         NSHumanReadableCopyright: ""
     settings:
