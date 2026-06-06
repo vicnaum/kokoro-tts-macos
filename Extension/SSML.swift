@@ -51,8 +51,10 @@ enum SSML {
 
     /// Spoken Content encodes its speed slider as `<prosody rate="PERCENT">`,
     /// where 100 = normal speed (the attribute is omitted at the default). Map it
-    /// to KokoroSwift's `speed` multiplier (1.0 = normal). Clamped so the slider
-    /// extremes (12.5%–400%) don't drive Kokoro into degenerate territory.
+    /// to KokoroSwift's `speed` multiplier (1.0 = normal). Clamped to a usable
+    /// band: below ~0.6× Kokoro drags and slurs, above ~1.4× it starts dropping
+    /// words — the slider's raw extremes (12.5%–400%) are unusable, so we fold
+    /// them into [0.6, 1.4] where output stays clean.
     static func speedMultiplier(from ssml: String) -> Float {
         // Scan the opening <prosody …> tag for rate="P".
         guard let prosody = ssml.range(of: "<prosody"),
@@ -65,7 +67,7 @@ enum SSML {
         // Float("12.5") return nil.
         let value = tag[rate.upperBound..<valueEnd].filter { $0.isNumber || $0 == "." }
         guard let percent = Float(value) else { return 1.0 }
-        return min(max(percent / 100.0, 0.5), 2.0)
+        return min(max(percent / 100.0, 0.6), 1.4)
     }
 
     // MARK: - Symbol normalization
@@ -98,6 +100,19 @@ enum SSML {
         for (from, to) in literal {
             text = text.replacingOccurrences(of: from, with: to)
         }
+
+        // Brackets: Misaki speaks the content but drops the bracket characters
+        // with NO pause, so a parenthetical glues onto its neighbors
+        // ("model (Kokoro) is" -> "model Kokoro is"). Turn each bracket into a
+        // comma so the aside gets a natural pause + intonation on both sides.
+        for bracket in ["(", ")", "[", "]", "{", "}"] {
+            text = text.replacingOccurrences(of: bracket, with: ", ")
+        }
+        // Tidy the inserted commas: no space before a comma, and collapse runs
+        // (adjacent/empty brackets) down to a single pause.
+        text = text.replacingOccurrences(of: #"[ \t]+,"#, with: ",", options: .regularExpression)
+        text = text.replacingOccurrences(of: #"(,[ \t]*){2,}"#, with: ", ", options: .regularExpression)
+
         return text
     }
 

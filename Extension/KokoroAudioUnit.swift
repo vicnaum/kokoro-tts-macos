@@ -21,7 +21,10 @@
 //  Offline vs live: when the host renders offline (AVSpeechSynthesizer.write,
 //  capture-to-file) it drains faster than we synthesize, so the render block
 //  *waits* for the next chunk (safe — not the real-time thread), producing gap-
-//  free audio. In live playback it emits silence on underrun instead.
+//  free audio. Live playback can't block the real-time thread, so instead it
+//  *primes*: it buffers a couple of chunks before starting (and re-buffers after
+//  any underrun), giving a slower Mac a head start so it plays gap-free rather
+//  than stuttering. The cost is a slightly longer delay before the first word.
 //
 
 import AVFoundation
@@ -45,10 +48,13 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
 
     private static let sampleRate: Double = 24_000 // KokoroTTS.Constants.samplingRate
 
-    /// Conservative character proxy for Kokoro's 510 *phoneme-token* limit
-    /// (~1 token/char + specials). Packing target; `tooManyTokens` is the real
-    /// guard, so this only needs to be roughly right.
-    private static let maxCharBudget = 400
+    /// Target chunk size in characters. Sized for *streaming smoothness*, not
+    /// the 510-token model limit (we stay well under it): smaller chunks mean a
+    /// chunk's synthesis finishes well within the previous chunk's playback, so a
+    /// slower Mac stays ahead instead of underrunning mid-utterance. The trade-off
+    /// is more sentence-boundary prosody resets. `tooManyTokens` is still the hard
+    /// guard for pathological inputs.
+    private static let maxCharBudget = 160
 
     // MARK: - Streaming state
     //
@@ -56,11 +62,18 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
     // is guarded by `cond`, an NSCondition: the producer signals it after each
     // chunk so an offline render waiting for audio can wake up.
 
+    /// Live playback waits until this many chunks are buffered before it starts —
+    /// and re-waits after an underrun — so a slower Mac builds a head start and
+    /// plays gap-free instead of stuttering. Offline rendering ignores this (it
+    /// can safely block per-chunk; it's not the real-time thread).
+    private static let livePrimeChunks = 2
+
     private let cond = NSCondition()
     private var pendingChunks: [[Float]] = []   // synthesized chunks awaiting playback
     private var currentChunk: [Float] = []      // chunk currently being rendered
     private var chunkIndex: Int = 0             // read cursor within currentChunk
     private var synthesisFinished = false       // all input has been synthesized
+    private var livePrimed = false              // live playback has buffered its head start
     private var generation: Int = 0             // bumped per request/cancel to drop stale work
 
     private let synthQueue = DispatchQueue(
@@ -159,6 +172,7 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
         currentChunk = []
         chunkIndex = 0
         synthesisFinished = false
+        livePrimed = false
         cond.signal()
         cond.unlock()
 
@@ -282,6 +296,7 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
         pendingChunks.removeAll(keepingCapacity: true)
         currentChunk = []
         chunkIndex = 0
+        livePrimed = false
         synthesisFinished = true    // let the render block complete (and wake if waiting)
         cond.signal()
         cond.unlock()
@@ -396,6 +411,19 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
             }
 
             self.cond.lock()
+
+            // Live priming: don't begin (or resume after an underrun) until a few
+            // chunks are buffered, so a slower Mac plays gap-free instead of
+            // stuttering. Offline rendering skips this and waits per-chunk below.
+            if !self.isRenderingOffline, !self.livePrimed {
+                if !self.synthesisFinished, self.pendingChunks.count < Self.livePrimeChunks {
+                    self.cond.unlock()
+                    for i in 0..<frameCountInt { frames[i] = 0 }
+                    return noErr
+                }
+                self.livePrimed = true
+            }
+
             var filled = 0
             while filled < frameCountInt {
                 // Need a fresh chunk?
@@ -414,6 +442,9 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
                             self.cond.wait()   // releases the lock until signaled
                             continue
                         }
+                        // Live underrun: re-prime so we resume only once enough is
+                        // buffered again — one clean pause instead of a stutter.
+                        self.livePrimed = false
                         self.cond.unlock()
                         for i in filled..<frameCountInt { frames[i] = 0 }
                         return noErr

@@ -207,12 +207,30 @@ Verified emitting correctly via `AVSpeechSynthesizer`'s `willSpeakRange` delegat
 implement `willSpeakRange` highlight; macOS **Spoken Content** highlighting of
 third-party voices is a longstanding, inconsistent Apple bug (not our code).
 
-1. Map Spoken Content rate slider: parse `<prosody rate>` from the SSML
-   instead of stripping it (KokoroSwift `generateAudio` has a `speed:` param).
-2. More voices: add entries to `VoiceManifest.swift` (try `af_bella`,
-   `bf_emma` — British voices exercise the `.enGB` path).
-3. Longer paragraph pauses: insert silence chunks between paragraphs in the AU.
-4. Maybe: swap in a future emotive model (MisoTTS-8B is too big for an
+**Done (v1.3.0):** (a) **rate slider** — `SSML.speedMultiplier` parses
+`<prosody rate="PERCENT">` and threads it to `generateAudio(speed:)`; the host
+injects a stray invisible char into the rate value (`Float("12.5")` → nil), so
+the value is digit/dot-filtered. Clamped to **[0.6, 1.4]** — below ~0.6× Kokoro
+drags/slurs, above ~1.4× it drops words (the slider's raw 12.5–400% extremes are
+unusable). (b) **parentheses → pauses** — Misaki speaks bracketed content but
+drops the bracket chars with no pause, gluing the aside onto its neighbors;
+`normalizeSymbols` now turns `()[]{}` into commas (verified via PhonemeDump).
+(c) **streaming smoothness on slower Macs** — live playback underran on a slower
+machine (synthesis fell behind playback → silence gaps/stutter, machine-
+dependent; fine on a fast Mac). Fix: the live render block now **primes**
+(buffers `livePrimeChunks = 2` chunks before starting, re-buffers after any
+underrun → one clean pause instead of a stutter), and `maxCharBudget` dropped
+400 → **160** so each chunk's synthesis finishes well within the previous chunk's
+playback. Trade-off: a slightly longer delay before the first word. *Live priming
+can't be verified from this (fast) Mac — needs testing on the slower machine; if
+first-word latency is too high or it falls back to the robotic voice, lower
+`livePrimeChunks` to 1.*
+
+1. More voices: add entries to `VoiceManifest.swift` (try `af_bella`,
+   `bf_emma` — British voices exercise the `.enGB` path). Wanted with an in-app
+   **preview** UX (preview one sentence per voice).
+2. Longer paragraph pauses: insert silence chunks between paragraphs in the AU.
+3. Maybe: swap in a future emotive model (MisoTTS-8B is too big for an
    extension; Kokoro is the right size for this architecture).
 
 **Dev tool — `PhonemeDump`** (`Tools/`, `type: tool` in project.yml): runs
