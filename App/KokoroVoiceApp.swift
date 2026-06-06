@@ -14,7 +14,7 @@ struct KokoroVoiceApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
-                .frame(minWidth: 520, minHeight: 480)
+                .frame(minWidth: 560, minHeight: 680)
         }
     }
 }
