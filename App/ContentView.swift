@@ -13,6 +13,15 @@ import SwiftUI
 struct ContentView: View {
     private static let identifierPrefix = "com.vicnaum.kokorovoice."
 
+    /// Shown in the title and header so it's obvious which build is installed
+    /// (read from the bundle, so it always matches the actual app).
+    private static var appVersion: String {
+        let info = Bundle.main.infoDictionary
+        let short = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        return "v\(short) (\(build))"
+    }
+
     @State private var kokoroVoices: [AVSpeechSynthesisVoice] = []
     @State private var selectedIdentifier: String = ""
     @State private var text = "Hello! I am Kokoro, a neural voice running entirely on this Mac."
@@ -21,8 +30,14 @@ struct ContentView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Kokoro Voice")
-                .font(.largeTitle.bold())
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text("Kokoro Voice")
+                    .font(.largeTitle.bold())
+                Text(Self.appVersion)
+                    .font(.title3)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
 
             GroupBox("Status") {
                 HStack {
@@ -80,6 +95,7 @@ struct ContentView: View {
             Spacer()
         }
         .padding(24)
+        .navigationTitle("Kokoro Voice \(Self.appVersion)")
         .onAppear { reloadVoices() }
     }
 
