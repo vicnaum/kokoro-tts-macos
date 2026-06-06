@@ -76,6 +76,13 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
     private var livePrimed = false              // live playback has buffered its head start
     private var generation: Int = 0             // bumped per request/cancel to drop stale work
 
+    // MARK: - Diagnostics (temporary — to root-cause the slow-Mac playback glitch)
+    private var dbgRenderLogged = false
+    private var dbgTotalRendered = 0
+    private var dbgUnderruns = 0
+    private var dbgSlowCallbacks = 0
+    private var dbgLastCbEnd: Double = 0
+
     private let synthQueue = DispatchQueue(
         label: "com.vicnaum.kokorovoice.synth", qos: .userInitiated
     )
@@ -173,6 +180,11 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
         chunkIndex = 0
         synthesisFinished = false
         livePrimed = false
+        dbgRenderLogged = false
+        dbgTotalRendered = 0
+        dbgUnderruns = 0
+        dbgSlowCallbacks = 0
+        dbgLastCbEnd = 0
         cond.signal()
         cond.unlock()
 
@@ -206,13 +218,20 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
         var ssmlCursor = ssml.startIndex
         var frameOffset = 0
 
-        for chunk in Self.chunks(for: text) {
+        let chunkList = Self.chunks(for: text)
+        NSLog("KokoroVoice: [diag] stream start gen=\(gen) chars=\(text.count) chunks=\(chunkList.count) voice=\(definition.npzKey) speed=\(String(format: "%.2f", speed)) budget=\(Self.maxCharBudget) primeChunks=\(Self.livePrimeChunks)")
+        let streamT0 = CFAbsoluteTimeGetCurrent()
+
+        for chunk in chunkList {
             guard isCurrent(gen) else { return } // superseded or cancelled
             frameOffset += synthesizeChunk(chunk, engine: engine, embedding: embedding,
                                            language: language, speed: speed, request: request, ssml: ssml,
                                            ssmlCursor: &ssmlCursor, startFrame: frameOffset,
                                            generation: gen, depth: 0)
         }
+        let streamWall = CFAbsoluteTimeGetCurrent() - streamT0
+        let audioSec = Double(frameOffset) / Self.sampleRate
+        NSLog("KokoroVoice: [diag] stream done gen=\(gen) audio=\(String(format: "%.2f", audioSec))s synthWall=\(String(format: "%.2f", streamWall))s overallRTF=\(String(format: "%.2f", streamWall / max(audioSec, 0.001))) underruns=\(dbgUnderruns) slowCallbacks=\(dbgSlowCallbacks)")
         finishSynthesis(generation: gen)
     }
 
@@ -229,8 +248,12 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
                                  generation gen: Int, depth: Int) -> Int {
         guard isCurrent(gen) else { return 0 }
         do {
+            let synthT0 = CFAbsoluteTimeGetCurrent()
             let (audio, tokens) = try engine.generateAudio(voice: embedding, language: language,
                                                            text: text, speed: speed)
+            let synthSec = CFAbsoluteTimeGetCurrent() - synthT0
+            let chunkAudioSec = Double(audio.count) / Self.sampleRate
+            NSLog("KokoroVoice: [diag] synth chunk chars=\(text.count) depth=\(depth) audio=\(String(format: "%.2f", chunkAudioSec))s synth=\(String(format: "%.2f", synthSec))s RTF=\(String(format: "%.2f", synthSec / max(chunkAudioSec, 0.001))) (RTF<1.0 = faster than real-time)")
             enqueue(audio, generation: gen)
             if let tokens {
                 emitWordMarkers(tokens, request: request, ssml: ssml,
@@ -410,7 +433,53 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
                 return noErr
             }
 
+            // --- Diagnostics: time the whole callback + the lock acquisition, so
+            // we can tell a real-time-thread stall (lock contention / starvation)
+            // apart from a plain buffer underrun. All logging happens in `defer`,
+            // after the lock is released, so it never extends the locked region.
+            let cbStart = CFAbsoluteTimeGetCurrent()
+            let budget = Double(frameCountInt) / Self.sampleRate
+            var lockWait = 0.0
+            var logFirst = false
+            var logPrimed = false
+            var logUnderrunAtFrame = -1
+            var logCompleteAtFrame = -1
+            defer {
+                let now = CFAbsoluteTimeGetCurrent()
+                let dur = now - cbStart
+                let gap = self.dbgLastCbEnd > 0 ? cbStart - self.dbgLastCbEnd : 0
+                self.dbgLastCbEnd = now
+                if logFirst {
+                    NSLog("KokoroVoice: [diag] first render callback offline=\(self.isRenderingOffline) frameCount=\(frameCountInt) budget=\(String(format: "%.1f", budget * 1000))ms")
+                }
+                if logPrimed { NSLog("KokoroVoice: [diag] primed — live playback starting") }
+                if logUnderrunAtFrame >= 0, self.dbgUnderruns <= 50 {
+                    NSLog("KokoroVoice: [diag] LIVE UNDERRUN #\(self.dbgUnderruns) at \(String(format: "%.2f", Double(logUnderrunAtFrame) / Self.sampleRate))s — re-priming")
+                }
+                if logCompleteAtFrame >= 0 {
+                    NSLog("KokoroVoice: [diag] render complete total=\(String(format: "%.2f", Double(logCompleteAtFrame) / Self.sampleRate))s underruns=\(self.dbgUnderruns) anomalies=\(self.dbgSlowCallbacks)")
+                }
+                // Real-time anomalies (live only): a callback that runs longer than
+                // its audio budget, waits a long time for the lock (contention with
+                // the synthesis thread), or a long gap since the previous callback
+                // (the HAL pulled us late / starvation). Any of these → audible glitch.
+                if !self.isRenderingOffline {
+                    let slow = dur > budget * 0.8 || lockWait > budget * 0.5
+                    let lateGap = self.livePrimed && gap > budget * 2.0
+                    if slow || lateGap {
+                        self.dbgSlowCallbacks += 1
+                        if self.dbgSlowCallbacks <= 80 {
+                            NSLog("KokoroVoice: [diag] RT ANOMALY #\(self.dbgSlowCallbacks) dur=\(String(format: "%.1f", dur * 1000))ms lockWait=\(String(format: "%.1f", lockWait * 1000))ms gap=\(String(format: "%.1f", gap * 1000))ms budget=\(String(format: "%.1f", budget * 1000))ms")
+                        }
+                    }
+                }
+            }
+
+            let lockT0 = CFAbsoluteTimeGetCurrent()
             self.cond.lock()
+            lockWait = CFAbsoluteTimeGetCurrent() - lockT0
+
+            if !self.dbgRenderLogged { self.dbgRenderLogged = true; logFirst = true }
 
             // Live priming: don't begin (or resume after an underrun) until a few
             // chunks are buffered, so a slower Mac plays gap-free instead of
@@ -422,6 +491,7 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
                     return noErr
                 }
                 self.livePrimed = true
+                logPrimed = true
             }
 
             var filled = 0
@@ -433,6 +503,8 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
                             self.cond.unlock()
                             for i in filled..<frameCountInt { frames[i] = 0 }
                             actionFlags.pointee = .offlineUnitRenderAction_Complete
+                            self.dbgTotalRendered += filled
+                            logCompleteAtFrame = self.dbgTotalRendered
                             return noErr
                         }
                         // Underrun, more is coming. Offline: wait for it (the
@@ -445,6 +517,9 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
                         // Live underrun: re-prime so we resume only once enough is
                         // buffered again — one clean pause instead of a stutter.
                         self.livePrimed = false
+                        self.dbgUnderruns += 1
+                        self.dbgTotalRendered += filled
+                        logUnderrunAtFrame = self.dbgTotalRendered
                         self.cond.unlock()
                         for i in filled..<frameCountInt { frames[i] = 0 }
                         return noErr
@@ -462,6 +537,7 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
                 self.chunkIndex += take
             }
             self.cond.unlock()
+            self.dbgTotalRendered += filled
             return noErr
         }
     }
