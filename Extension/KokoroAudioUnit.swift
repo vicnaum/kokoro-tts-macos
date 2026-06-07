@@ -18,13 +18,15 @@
 //  synth time via `tooManyTokens` and re-split at the next natural boundary
 //  (clause -> word -> hard cut), so no input is ever dropped.
 //
-//  Offline vs live: when the host renders offline (AVSpeechSynthesizer.write,
-//  capture-to-file) it drains faster than we synthesize, so the render block
-//  *waits* for the next chunk (safe — not the real-time thread), producing gap-
-//  free audio. Live playback can't block the real-time thread, so instead it
-//  *primes*: it buffers a couple of chunks before starting (and re-buffers after
-//  any underrun), giving a slower Mac a head start so it plays gap-free rather
-//  than stuttering. The cost is a slightly longer delay before the first word.
+//  Real-time-safe playback: the producer writes synthesized samples into a fixed,
+//  pre-allocated buffer and publishes the valid sample count via an atomic. The
+//  render block (the audio thread) does nothing but a lock-free atomic read and a
+//  memcpy from the already-written region — no mutex, no waiting, no allocation,
+//  no ARC. That matters because the host renders us "offline" but pulls paced ~
+//  real-time, so a slow/contended render callback (locks, ARC, logging) makes the
+//  audio output skip mid-word under CPU load. A NSCondition is used ONLY on the
+//  cold path (warm-up before any audio exists, or rare starvation) — never on the
+//  steady-state hot path.
 //
 
 import AVFoundation
@@ -32,6 +34,7 @@ import KokoroSwift
 import MLX
 import MLXUtilsLibrary
 import NaturalLanguage
+import Synchronization
 
 public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
 
@@ -63,36 +66,25 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
     private static let leadingSilenceCap = Int(0.06 * sampleRate)   // 60 ms
     private static let trailingSilenceCap = Int(0.34 * sampleRate)  // 340 ms
 
-    // MARK: - Streaming state
-    //
-    // Producer: `synthQueue` (background). Consumer: the render block. All of it
-    // is guarded by `cond`, an NSCondition: the producer signals it after each
-    // chunk so an offline render waiting for audio can wake up.
+    // MARK: - Playback buffer (real-time-safe producer→consumer hand-off)
 
-    /// Live playback waits until this many chunks are buffered before it starts —
-    /// and re-waits after an underrun — so a slower Mac builds a head start and
-    /// plays gap-free instead of stuttering. Offline rendering ignores this (it
-    /// can safely block per-chunk; it's not the real-time thread).
-    private static let livePrimeChunks = 2
+    /// Max audio per utterance, in samples (~6 min at 24 kHz ≈ 35 MB). Longer
+    /// utterances are truncated (logged) — far beyond any normal request.
+    private static let audioCapacity = Int(sampleRate) * 360
 
-    private let cond = NSCondition()
-    private var pendingChunks: [[Float]] = []   // synthesized chunks awaiting playback
-    private var currentChunk: [Float] = []      // chunk currently being rendered
-    private var chunkIndex: Int = 0             // read cursor within currentChunk
-    private var synthesisFinished = false       // all input has been synthesized
-    private var livePrimed = false              // live playback has buffered its head start
-    private var generation: Int = 0             // bumped per request/cancel to drop stale work
+    /// Stable, pre-allocated sample buffer. The producer appends; the render block
+    /// reads the [0, availableCount) region, which the producer never rewrites.
+    private let audioBuffer = UnsafeMutablePointer<Float>.allocate(capacity: KokoroAudioUnit.audioCapacity)
 
-    // MARK: - Diagnostics (temporary — to root-cause the slow-Mac playback glitch)
-    private var dbgRenderLogged = false
-    private var dbgTotalRendered = 0
-    private var dbgUnderruns = 0
-    private var dbgSlowCallbacks = 0
-    private var dbgLastCbEnd: Double = 0
-    private var dbgFirstCbTime: Double = 0      // wall time of first render callback
-    private var dbgOfflineWaitCount = 0         // times the offline render blocked for a chunk
-    private var dbgOfflineWaitTotal: Double = 0 // total seconds blocked
-    private var dbgOfflineWaitMax: Double = 0   // longest single block (the glitch signature)
+    private let availableCount = Atomic<Int>(0)   // samples ready to play (producer→render)
+    private let producerDone = Atomic<Bool>(false)
+    private let generation = Atomic<Int>(0)       // bumped per request/cancel to drop stale work
+    private let cond = NSCondition()              // cold-path wait/signal ONLY (never the hot path)
+
+    private var producerWritten = 0   // producer/synthQueue-thread only
+    private var renderCursor = 0      // render-thread only
+    private var renderGen = -1        // render-thread only
+    private var renderColdEntries = 0 // render-thread only (diagnostic)
 
     private let synthQueue = DispatchQueue(
         label: "com.vicnaum.kokorovoice.synth", qos: .userInitiated
@@ -131,6 +123,8 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
             busses: [outputBus]
         )
     }
+
+    deinit { audioBuffer.deallocate() }
 
     // MARK: - Voice catalog
 
@@ -182,26 +176,12 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
         let speed = SSML.speedMultiplier(from: speechRequest.ssmlRepresentation)
         let voiceIdentifier = speechRequest.voice.identifier
 
-        // Reset streaming state and claim a new generation atomically.
-        cond.lock()
-        generation &+= 1
-        let gen = generation
-        pendingChunks.removeAll(keepingCapacity: true)
-        currentChunk = []
-        chunkIndex = 0
-        synthesisFinished = false
-        livePrimed = false
-        dbgRenderLogged = false
-        dbgTotalRendered = 0
-        dbgUnderruns = 0
-        dbgSlowCallbacks = 0
-        dbgLastCbEnd = 0
-        dbgFirstCbTime = 0
-        dbgOfflineWaitCount = 0
-        dbgOfflineWaitTotal = 0
-        dbgOfflineWaitMax = 0
-        cond.signal()
-        cond.unlock()
+        // Claim a new generation and reset the published buffer state. (producerWritten
+        // is reset on synthQueue, which is serial, so it can't race a prior synth.)
+        let gen = generation.wrappingAdd(1, ordering: .relaxed).newValue
+        availableCount.store(0, ordering: .releasing)
+        producerDone.store(false, ordering: .releasing)
+        cond.lock(); cond.broadcast(); cond.unlock()   // wake any render waiting on the old generation
 
         guard !text.isEmpty else { finishSynthesis(generation: gen); return }
 
@@ -213,6 +193,7 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
 
     private func runStreamingSynthesis(text: String, voiceIdentifier: String, speed: Float,
                                        request: AVSpeechSynthesisProviderRequest, generation gen: Int) {
+        producerWritten = 0   // serial synthQueue: safe to reset here
         guard ensureEngineLoaded(), let engine else { finishSynthesis(generation: gen); return }
 
         let definition = KokoroVoiceManifest.definition(forIdentifier: voiceIdentifier)
@@ -226,27 +207,24 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
         // Kokoro naming: 'a' prefix = US English, 'b' = British English.
         let language: KokoroSwift.Language = definition.npzKey.hasPrefix("b") ? .enGB : .enUS
 
-        // Word-highlighting state (threaded locally, no shared races): a cursor
-        // into the ORIGINAL SSML — tokens are matched back to it in order — and a
-        // running frame offset into the audio we've produced so far.
+        // Word-highlighting state: a cursor into the ORIGINAL SSML (tokens are
+        // matched back to it in order). Frame offsets come from `producerWritten`.
         let ssml = request.ssmlRepresentation
         var ssmlCursor = ssml.startIndex
-        var frameOffset = 0
 
         let chunkList = Self.chunks(for: text)
-        NSLog("KokoroVoice: [diag] stream start gen=\(gen) chars=\(text.count) chunks=\(chunkList.count) voice=\(definition.npzKey) speed=\(String(format: "%.2f", speed)) budget=\(Self.maxCharBudget) primeChunks=\(Self.livePrimeChunks)")
+        NSLog("KokoroVoice: [diag] stream start gen=\(gen) chars=\(text.count) chunks=\(chunkList.count) voice=\(definition.npzKey) speed=\(String(format: "%.2f", speed)) budget=\(Self.maxCharBudget)")
         let streamT0 = CFAbsoluteTimeGetCurrent()
 
         for chunk in chunkList {
             guard isCurrent(gen) else { return } // superseded or cancelled
-            frameOffset += synthesizeChunk(chunk, engine: engine, embedding: embedding,
-                                           language: language, speed: speed, request: request, ssml: ssml,
-                                           ssmlCursor: &ssmlCursor, startFrame: frameOffset,
-                                           generation: gen, depth: 0)
+            synthesizeChunk(chunk, engine: engine, embedding: embedding,
+                            language: language, speed: speed, request: request, ssml: ssml,
+                            ssmlCursor: &ssmlCursor, generation: gen, depth: 0)
         }
         let streamWall = CFAbsoluteTimeGetCurrent() - streamT0
-        let audioSec = Double(frameOffset) / Self.sampleRate
-        NSLog("KokoroVoice: [diag] stream done gen=\(gen) audio=\(String(format: "%.2f", audioSec))s synthWall=\(String(format: "%.2f", streamWall))s overallRTF=\(String(format: "%.2f", streamWall / max(audioSec, 0.001))) underruns=\(dbgUnderruns) slowCallbacks=\(dbgSlowCallbacks)")
+        let audioSec = Double(producerWritten) / Self.sampleRate
+        NSLog("KokoroVoice: [diag] stream done gen=\(gen) audio=\(String(format: "%.2f", audioSec))s synthWall=\(String(format: "%.2f", streamWall))s overallRTF=\(String(format: "%.2f", streamWall / max(audioSec, 0.001)))")
         finishSynthesis(generation: gen)
     }
 
@@ -259,7 +237,7 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
     private func synthesizeChunk(_ text: String, engine: KokoroTTS, embedding: MLXArray,
                                  language: KokoroSwift.Language, speed: Float,
                                  request: AVSpeechSynthesisProviderRequest, ssml: String,
-                                 ssmlCursor: inout String.Index, startFrame: Int,
+                                 ssmlCursor: inout String.Index,
                                  generation gen: Int, depth: Int) -> Int {
         guard isCurrent(gen) else { return 0 }
         do {
@@ -274,19 +252,19 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
             let rawSec = Double(rawAudio.count) / Self.sampleRate
             let chunkAudioSec = Double(audio.count) / Self.sampleRate
             NSLog("KokoroVoice: [diag] synth chunk chars=\(text.count) depth=\(depth) audio=\(String(format: "%.2f", chunkAudioSec))s (raw \(String(format: "%.2f", rawSec))s) synth=\(String(format: "%.2f", synthSec))s RTF=\(String(format: "%.2f", synthSec / max(rawSec, 0.001))) (RTF<1.0 = faster than real-time)")
-            enqueue(audio, generation: gen)
+            let baseFrame = producerWritten
+            let written = appendSamples(audio, generation: gen)
             if let tokens {
                 emitWordMarkers(tokens, request: request, ssml: ssml,
-                                ssmlCursor: &ssmlCursor, startFrame: startFrame - leadingRemoved, generation: gen)
+                                ssmlCursor: &ssmlCursor, startFrame: baseFrame - leadingRemoved, generation: gen)
             }
-            return audio.count
+            return written
         } catch KokoroTTS.KokoroTTSError.tooManyTokens where depth < 6 {
             var produced = 0
             for piece in Self.splitTooLong(text) {
                 produced += synthesizeChunk(piece, engine: engine, embedding: embedding,
                                             language: language, speed: speed, request: request, ssml: ssml,
-                                            ssmlCursor: &ssmlCursor, startFrame: startFrame + produced,
-                                            generation: gen, depth: depth + 1)
+                                            ssmlCursor: &ssmlCursor, generation: gen, depth: depth + 1)
             }
             return produced
         } catch {
@@ -334,37 +312,43 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
     }
 
     public override func cancelSpeechRequest() {
-        cond.lock()
-        generation &+= 1            // invalidate any in-flight background synthesis
-        pendingChunks.removeAll(keepingCapacity: true)
-        currentChunk = []
-        chunkIndex = 0
-        livePrimed = false
-        synthesisFinished = true    // let the render block complete (and wake if waiting)
-        cond.signal()
-        cond.unlock()
+        generation.wrappingAdd(1, ordering: .relaxed)   // invalidate any in-flight synthesis
+        availableCount.store(0, ordering: .releasing)
+        producerDone.store(true, ordering: .releasing)  // let a waiting render complete
+        cond.lock(); cond.broadcast(); cond.unlock()
     }
 
-    // MARK: - Streaming queue helpers (producer side)
+    // MARK: - Producer side (synthQueue)
 
     private func isCurrent(_ gen: Int) -> Bool {
-        cond.lock(); defer { cond.unlock() }
-        return gen == generation
+        gen == generation.load(ordering: .acquiring)
     }
 
-    private func enqueue(_ samples: [Float], generation gen: Int) {
-        guard !samples.isEmpty else { return }
-        cond.lock()
-        if gen == generation { pendingChunks.append(samples) }
-        cond.signal()
-        cond.unlock()
+    /// Append synthesized samples to the playback buffer and publish the new count.
+    /// Producer/synthQueue thread only. Returns frames actually written (may be less
+    /// than `samples.count` if the buffer is full). Wakes a cold-path render.
+    @discardableResult
+    private func appendSamples(_ samples: [Float], generation gen: Int) -> Int {
+        guard !samples.isEmpty, gen == generation.load(ordering: .acquiring) else { return 0 }
+        let n = min(samples.count, Self.audioCapacity - producerWritten)
+        if n > 0 {
+            samples.withUnsafeBufferPointer { src in
+                (audioBuffer + producerWritten).update(from: src.baseAddress!, count: n)
+            }
+            producerWritten += n
+            availableCount.store(producerWritten, ordering: .releasing)  // publish (release): samples are written before this
+            cond.lock(); cond.signal(); cond.unlock()
+        }
+        if n < samples.count {
+            NSLog("KokoroVoice: [diag] playback buffer full at \(Self.audioCapacity / Int(Self.sampleRate))s — truncating utterance")
+        }
+        return n
     }
 
     private func finishSynthesis(generation gen: Int) {
-        cond.lock()
-        if gen == generation { synthesisFinished = true }
-        cond.signal()
-        cond.unlock()
+        guard gen == generation.load(ordering: .acquiring) else { return }
+        producerDone.store(true, ordering: .releasing)
+        cond.lock(); cond.broadcast(); cond.unlock()
     }
 
     // MARK: - Text chunking
@@ -473,123 +457,53 @@ public class KokoroAudioUnit: AVSpeechSynthesisProviderAudioUnit {
                 return noErr
             }
 
-            // --- Diagnostics: time the whole callback + the lock acquisition, so
-            // we can tell a real-time-thread stall (lock contention / starvation)
-            // apart from a plain buffer underrun. All logging happens in `defer`,
-            // after the lock is released, so it never extends the locked region.
-            let cbStart = CFAbsoluteTimeGetCurrent()
-            let budget = Double(frameCountInt) / Self.sampleRate
-            var lockWait = 0.0
-            var logFirst = false
-            var logPrimed = false
-            var logUnderrunAtFrame = -1
-            var logCompleteAtFrame = -1
-            defer {
-                let now = CFAbsoluteTimeGetCurrent()
-                let dur = now - cbStart
-                let gap = self.dbgLastCbEnd > 0 ? cbStart - self.dbgLastCbEnd : 0
-                self.dbgLastCbEnd = now
-                if logFirst {
-                    NSLog("KokoroVoice: [diag] first render callback offline=\(self.isRenderingOffline) frameCount=\(frameCountInt) budget=\(String(format: "%.1f", budget * 1000))ms")
-                }
-                if logPrimed { NSLog("KokoroVoice: [diag] primed — live playback starting") }
-                if logUnderrunAtFrame >= 0, self.dbgUnderruns <= 50 {
-                    NSLog("KokoroVoice: [diag] LIVE UNDERRUN #\(self.dbgUnderruns) at \(String(format: "%.2f", Double(logUnderrunAtFrame) / Self.sampleRate))s — re-priming")
-                }
-                if logCompleteAtFrame >= 0 {
-                    let audioSec = Double(logCompleteAtFrame) / Self.sampleRate
-                    let pullWall = self.dbgFirstCbTime > 0 ? now - self.dbgFirstCbTime : 0
-                    let pullRate = pullWall > 0 ? audioSec / pullWall : 0
-                    NSLog("KokoroVoice: [diag] render complete audio=\(String(format: "%.2f", audioSec))s pullWall=\(String(format: "%.2f", pullWall))s pullRate=\(String(format: "%.2f", pullRate))x | offlineBlocks=\(self.dbgOfflineWaitCount) total=\(String(format: "%.2f", self.dbgOfflineWaitTotal))s max=\(String(format: "%.2f", self.dbgOfflineWaitMax))s | underruns=\(self.dbgUnderruns) anomalies=\(self.dbgSlowCallbacks)")
-                }
-                // Real-time anomalies (live only): a callback that runs longer than
-                // its audio budget, waits a long time for the lock (contention with
-                // the synthesis thread), or a long gap since the previous callback
-                // (the HAL pulled us late / starvation). Any of these → audible glitch.
-                if !self.isRenderingOffline {
-                    let slow = dur > budget * 0.8 || lockWait > budget * 0.5
-                    let lateGap = self.livePrimed && gap > budget * 2.0
-                    if slow || lateGap {
-                        self.dbgSlowCallbacks += 1
-                        if self.dbgSlowCallbacks <= 80 {
-                            NSLog("KokoroVoice: [diag] RT ANOMALY #\(self.dbgSlowCallbacks) dur=\(String(format: "%.1f", dur * 1000))ms lockWait=\(String(format: "%.1f", lockWait * 1000))ms gap=\(String(format: "%.1f", gap * 1000))ms budget=\(String(format: "%.1f", budget * 1000))ms")
-                        }
-                    }
-                }
-            }
-
-            let lockT0 = CFAbsoluteTimeGetCurrent()
-            self.cond.lock()
-            lockWait = CFAbsoluteTimeGetCurrent() - lockT0
-
-            if !self.dbgRenderLogged { self.dbgRenderLogged = true; logFirst = true; self.dbgFirstCbTime = cbStart }
-
-            // Live priming: don't begin (or resume after an underrun) until a few
-            // chunks are buffered, so a slower Mac plays gap-free instead of
-            // stuttering. Offline rendering skips this and waits per-chunk below.
-            if !self.isRenderingOffline, !self.livePrimed {
-                if !self.synthesisFinished, self.pendingChunks.count < Self.livePrimeChunks {
-                    self.cond.unlock()
-                    for i in 0..<frameCountInt { frames[i] = 0 }
-                    return noErr
-                }
-                self.livePrimed = true
-                logPrimed = true
+            // New utterance? reset our render-thread-only read cursor.
+            let gen = self.generation.load(ordering: .acquiring)
+            if gen != self.renderGen {
+                self.renderGen = gen
+                self.renderCursor = 0
+                self.renderColdEntries = 0
             }
 
             var filled = 0
             while filled < frameCountInt {
-                // Need a fresh chunk?
-                if self.chunkIndex >= self.currentChunk.count {
-                    if self.pendingChunks.isEmpty {
-                        if self.synthesisFinished {
-                            self.cond.unlock()
-                            for i in filled..<frameCountInt { frames[i] = 0 }
-                            actionFlags.pointee = .offlineUnitRenderAction_Complete
-                            self.dbgTotalRendered += filled
-                            logCompleteAtFrame = self.dbgTotalRendered
-                            return noErr
-                        }
-                        // Underrun, more is coming. Offline: wait for it (the
-                        // render thread isn't real-time). Live: emit silence and
-                        // pick up the audio on the next render callback.
-                        if self.isRenderingOffline {
-                            // Offline (the path AVSpeechSynthesizer / Spoken Content
-                            // actually use): block until the next chunk exists. The
-                            // host pulls this paced ~real-time, so a long block here
-                            // on a slow Mac starves playback → the glitch. Measure it.
-                            let waitStart = CFAbsoluteTimeGetCurrent()
-                            self.cond.wait()   // releases the lock until signaled
-                            let waited = CFAbsoluteTimeGetCurrent() - waitStart
-                            self.dbgOfflineWaitCount += 1
-                            self.dbgOfflineWaitTotal += waited
-                            if waited > self.dbgOfflineWaitMax { self.dbgOfflineWaitMax = waited }
-                            continue
-                        }
-                        // Live underrun: re-prime so we resume only once enough is
-                        // buffered again — one clean pause instead of a stutter.
-                        self.livePrimed = false
-                        self.dbgUnderruns += 1
-                        self.dbgTotalRendered += filled
-                        logUnderrunAtFrame = self.dbgTotalRendered
-                        self.cond.unlock()
-                        for i in filled..<frameCountInt { frames[i] = 0 }
-                        return noErr
-                    }
-                    self.currentChunk = self.pendingChunks.removeFirst()
-                    self.chunkIndex = 0
+                let avail = self.availableCount.load(ordering: .acquiring)
+                let ready = avail - self.renderCursor
+                if ready > 0 {
+                    // HOT PATH — lock-free, allocation-free, ARC-free: copy from the
+                    // stable already-written region. This is ALL the audio thread does
+                    // in steady state, so a CPU spike can't make it miss its deadline.
+                    let take = min(ready, frameCountInt - filled)
+                    (frames + filled).update(from: self.audioBuffer + self.renderCursor, count: take)
+                    filled += take
+                    self.renderCursor += take
+                    continue
                 }
-
-                let available = self.currentChunk.count - self.chunkIndex
-                let take = min(available, frameCountInt - filled)
-                self.currentChunk.withUnsafeBufferPointer { src in
-                    (frames + filled).update(from: src.baseAddress! + self.chunkIndex, count: take)
+                if self.producerDone.load(ordering: .acquiring) {
+                    for i in filled..<frameCountInt { frames[i] = 0 }
+                    actionFlags.pointee = .offlineUnitRenderAction_Complete
+                    NSLog("KokoroVoice: [diag] render complete offline=\(self.isRenderingOffline) audio=\(String(format: "%.2f", Double(self.renderCursor) / Self.sampleRate))s coldWaits=\(self.renderColdEntries)")
+                    return noErr
                 }
-                filled += take
-                self.chunkIndex += take
+                // COLD PATH — no audio yet (warm-up, or rare starvation). Block until
+                // there's more. This never runs on the steady-state hot path, so it
+                // can't cause the load-induced mid-word stutter; it only covers the
+                // gap before the first samples exist (and keeps offline capture exact).
+                self.renderColdEntries += 1
+                self.cond.lock()
+                while self.generation.load(ordering: .acquiring) == gen,
+                      self.availableCount.load(ordering: .acquiring) - self.renderCursor <= 0,
+                      !self.producerDone.load(ordering: .acquiring) {
+                    self.cond.wait()
+                }
+                self.cond.unlock()
+                if self.generation.load(ordering: .acquiring) != gen {
+                    // a new utterance arrived while we waited; emit silence — the next
+                    // callback picks it up via the cursor reset at the top.
+                    for i in filled..<frameCountInt { frames[i] = 0 }
+                    return noErr
+                }
             }
-            self.cond.unlock()
-            self.dbgTotalRendered += filled
             return noErr
         }
     }
